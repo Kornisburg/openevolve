@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 
 from openevolve.config import DatabaseConfig
+from openevolve.storage import ProgramStorage
 from openevolve.utils.code_utils import calculate_edit_distance
 from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
 
@@ -110,6 +111,7 @@ class ProgramDatabase:
 
         # In-memory program storage
         self.programs: Dict[str, Program] = {}
+        self.storage = ProgramStorage()
 
         # Per-island feature grids for MAP-Elites
         self.island_feature_maps: List[Dict[str, str]] = [{} for _ in range(config.num_islands)]
@@ -590,7 +592,7 @@ class ProgramDatabase:
         self._cleanup_old_artifacts(save_path)
 
         # create directory if it doesn't exist
-        os.makedirs(save_path, exist_ok=True)
+        self.storage.ensure_base_path(save_path)
 
         # Save each program
         for program in self.programs.values():
@@ -617,8 +619,7 @@ class ProgramDatabase:
             "feature_stats": self._serialize_feature_stats(),
         }
 
-        with open(os.path.join(save_path, "metadata.json"), "w") as f:
-            json.dump(metadata, f)
+        self.storage.save_metadata(save_path, metadata)
 
         logger.info(f"Saved database with {len(self.programs)} programs to {save_path}")
 
@@ -634,12 +635,9 @@ class ProgramDatabase:
             return
 
         # Load metadata first
-        metadata_path = os.path.join(path, "metadata.json")
         saved_islands = []
-        if os.path.exists(metadata_path):
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-
+        metadata = self.storage.load_metadata(path)
+        if metadata:
             self.island_feature_maps = metadata.get(
                 "island_feature_maps", [{} for _ in range(self.config.num_islands)]
             )
@@ -662,20 +660,20 @@ class ProgramDatabase:
                 logger.info(f"Loaded feature_stats for {len(self.feature_stats)} dimensions")
 
         # Load programs
-        programs_dir = os.path.join(path, "programs")
-        if os.path.exists(programs_dir):
-            for program_file in os.listdir(programs_dir):
-                if program_file.endswith(".json"):
-                    program_path = os.path.join(programs_dir, program_file)
-                    try:
-                        with open(program_path, "r") as f:
-                            program_data = json.load(f)
+        for program_data in self.storage.iter_program_payloads(path) or []:
+            try:
+                # Backward compatibility: merge root-level prompts into metadata.prompts
+                prompts = program_data.pop("prompts", None)
+                if prompts:
+                    md = program_data.get("metadata") or {}
+                    if "prompts" not in md:
+                        md["prompts"] = prompts
+                        program_data["metadata"] = md
 
-                        program = Program.from_dict(program_data)
-                        self.programs[program.id] = program
-                    except Exception as e:
-                        logger.warning(f"Error loading program {program_file}: {str(e)}")
-
+                program = Program.from_dict(program_data)
+                self.programs[program.id] = program
+            except Exception as e:
+                logger.warning(f"Error loading program payload: {str(e)}")
         # Reconstruct island assignments from metadata
         self._reconstruct_islands(saved_islands)
 
@@ -804,18 +802,11 @@ class ProgramDatabase:
         if not save_path:
             return
 
-        # Create programs directory if it doesn't exist
-        programs_dir = os.path.join(save_path, "programs")
-        os.makedirs(programs_dir, exist_ok=True)
-
         # Save program
         program_dict = program.to_dict()
         if prompts:
             program_dict["prompts"] = prompts
-        program_path = os.path.join(programs_dir, f"{program.id}.json")
-
-        with open(program_path, "w") as f:
-            json.dump(program_dict, f)
+        self.storage.save_program(save_path, program.id, program_dict)
 
     def _calculate_feature_coords(self, program: Program) -> List[int]:
         """
