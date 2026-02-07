@@ -11,6 +11,7 @@ import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,14 @@ from openevolve.database import Program, ProgramDatabase
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
+
+class WorkerErrorType(str, Enum):
+    """Standardized worker error categories for observability and recovery."""
+
+    LLM_GENERATION = "llm_generation"
+    INVALID_RESPONSE = "invalid_response"
+    EVALUATION = "evaluation"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -33,7 +42,7 @@ class SerializableResult:
     artifacts: Optional[Dict[str, Any]] = None
     iteration: int = 0
     error: Optional[str] = None
-    target_island: Optional[int] = None  # Island where child should be placed
+    error_type: Optional[str] = None
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -205,11 +214,19 @@ def _run_iteration_worker(
             )
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
+            return SerializableResult(
+                error=f"LLM generation failed: {str(e)}",
+                error_type=WorkerErrorType.LLM_GENERATION.value,
+                iteration=iteration,
+            )
 
         # Check for None response
         if llm_response is None:
-            return SerializableResult(error="LLM returned None response", iteration=iteration)
+            return SerializableResult(
+                error="LLM returned None response",
+                error_type=WorkerErrorType.INVALID_RESPONSE.value,
+                iteration=iteration,
+            )
 
         # Parse response based on evolution mode
         if _worker_config.diff_based_evolution:
@@ -224,7 +241,9 @@ def _run_iteration_worker(
             diff_blocks = extract_diffs(llm_response, _worker_config.diff_pattern)
             if not diff_blocks:
                 return SerializableResult(
-                    error="No valid diffs found in response", iteration=iteration
+                    error=f"No valid diffs found in response",
+                    error_type=WorkerErrorType.INVALID_RESPONSE.value,
+                    iteration=iteration,
                 )
 
             if _worker_config.prompt.programs_as_changes_description:
@@ -272,7 +291,9 @@ def _run_iteration_worker(
             new_code = parse_full_rewrite(llm_response, _worker_config.language)
             if not new_code:
                 return SerializableResult(
-                    error=f"No valid code found in response", iteration=iteration
+                    error=f"No valid code found in response",
+                    error_type=WorkerErrorType.INVALID_RESPONSE.value,
+                    iteration=iteration,
                 )
 
             child_code = new_code
@@ -282,6 +303,7 @@ def _run_iteration_worker(
         if len(child_code) > _worker_config.max_code_length:
             return SerializableResult(
                 error=f"Generated code exceeds maximum length ({len(child_code)} > {_worker_config.max_code_length})",
+                error_type=WorkerErrorType.INVALID_RESPONSE.value,
                 iteration=iteration,
             )
 
@@ -329,7 +351,11 @@ def _run_iteration_worker(
 
     except Exception as e:
         logger.exception(f"Error in worker iteration {iteration}")
-        return SerializableResult(error=str(e), iteration=iteration)
+        return SerializableResult(
+            error=str(e),
+            error_type=WorkerErrorType.UNKNOWN.value,
+            iteration=iteration,
+        )
 
 
 class ProcessParallelController:
@@ -363,8 +389,9 @@ class ProcessParallelController:
         """Serialize config object to a dictionary that can be pickled"""
         # Manual serialization to handle nested objects properly
 
-        # The asdict() call itself triggers the deepcopy which tries to serialize novelty_llm. Remove it first.
-        config.database.novelty_llm = None
+        # Avoid mutating shared runtime config; create a serializable DB snapshot dict instead.
+        database_dict = asdict(config.database)
+        database_dict["novelty_llm"] = None
 
         return {
             "llm": {
@@ -380,7 +407,7 @@ class ProcessParallelController:
                 "retry_delay": config.llm.retry_delay,
             },
             "prompt": asdict(config.prompt),
-            "database": asdict(config.database),
+            "database": database_dict,
             "evaluator": asdict(config.evaluator),
             "max_iterations": config.max_iterations,
             "checkpoint_interval": config.checkpoint_interval,
@@ -554,7 +581,10 @@ class ProcessParallelController:
                 result = future.result(timeout=timeout_seconds)
 
                 if result.error:
-                    logger.warning(f"Iteration {completed_iteration} error: {result.error}")
+                    error_type = f" ({result.error_type})" if result.error_type else ""
+                    logger.warning(
+                        f"Iteration {completed_iteration} error{error_type}: {result.error}"
+                    )
                 elif result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
